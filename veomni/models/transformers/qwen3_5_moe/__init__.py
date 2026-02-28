@@ -11,9 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from veomni.models.transformers.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeModel
-from veomni.models.transformers.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
-from veomni.models.transformers.qwen3_vl_moe.modeling_qwen3_vl_moe import apply_veomni_qwen3vlmoe_patch
 from ...loader import MODELING_REGISTRY
 
 
@@ -25,10 +22,10 @@ def register_qwen3_5_moe_modeling(architecture: str):
         apply_veomni_qwen35moe_patch,
     )
 
-    apply_veomni_qwen3vlmoe_patch()
+    apply_veomni_qwen35moe_patch()
     if "ForConditionalGeneration" in architecture:
-        return Qwen3VLMoeForConditionalGeneration
+        return Qwen3_5MoeForConditionalGeneration
     elif "Model" in architecture:
-        return Qwen3VLMoeModel
+        return Qwen3_5MoeModel
     else:
-        return Qwen3VLMoeForConditionalGeneration
+        return Qwen3_5MoeForConditionalGeneration

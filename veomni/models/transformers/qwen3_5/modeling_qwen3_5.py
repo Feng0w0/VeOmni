@@ -1,27 +1,16 @@
-from functools import partial, lru_cache
+import copy
+from functools import lru_cache, partial
 from types import SimpleNamespace
 from typing import Optional, Union
 
-import copy
-import torch
 import numpy as np
+import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-
+import transformers.models.qwen3_5.modeling_qwen3_5 as hf_qwen35
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling
-from transformers.models.qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5Experts as _Qwen3_5Experts,
-)
-from transformers.models.qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5ForConditionalGeneration as _Qwen3_5ForConditionalGeneration,
-)
-from transformers.models.qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5Model as _Qwen3_5Model,
-)
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5CausalLMOutputWithPast,
     Qwen3_5ModelOutputWithPast,
@@ -30,19 +19,24 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     apply_rotary_pos_emb_vision,
     eager_attention_forward,
 )
-import transformers.models.qwen3_5.modeling_qwen3_5 as hf_qwen35
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5ForConditionalGeneration as _Qwen3_5ForConditionalGeneration,
+)
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5Model as _Qwen3_5Model,
+)
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
-    gather_outputs,
     gather_seq_scatter_heads,
-    get_ulysses_sequence_parallel_world_size,
     sp_pad_and_slice,
 )
+from ....utils import logging
 from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....utils.device import is_torch_npu_available
-from ....utils import logging
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
@@ -74,7 +68,7 @@ def Qwen3_5VisionAttention_forward(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface: Callable = eager_attention_forward
+    attention_interface = eager_attention_forward
     if self.config._attn_implementation != "eager":
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
@@ -226,9 +220,7 @@ def Qwen3_5VisionModel_forward(
 # get None pixel_values while others get valid pixel_values
 # ================================================================
 # --- Patch.1 ---
-def Qwen3_5VisionModel_dummy_forward(
-    self: Qwen3_5VisionModel
-):
+def Qwen3_5VisionModel_dummy_forward(self: Qwen3_5VisionModel):
     if get_parallel_state().sp_enabled:
         sp_size = get_parallel_state().sp_size
         pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
@@ -240,6 +232,8 @@ def Qwen3_5VisionModel_dummy_forward(
         grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
         dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
     return self(**dummy_data)
+
+
 # --- Patch.1 ---
 
 
@@ -306,6 +300,8 @@ def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
     embeddings = freq_table[pos_ids]  # lookup rotary embeddings
     embeddings = embeddings.flatten(1)
     return embeddings
+
+
 # --- Patch.1 ---
 
 
@@ -393,7 +389,7 @@ class Qwen3_5Model(_Qwen3_5Model):
                 The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
-        vision_output:BaseModelOutputWithPooling = self.visual(pixel_values, grid_thw=image_grid_thw)
+        vision_output: BaseModelOutputWithPooling = self.visual(pixel_values, grid_thw=image_grid_thw)
         # --- Patch.1 ---
         # image_embeds = vision_output.pooler_output
         # split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
@@ -442,7 +438,7 @@ class Qwen3_5Model(_Qwen3_5Model):
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
-        
+
         # --- Patch.3 ---
         # we use the pre-computed image and video mask to support ulysses
         image_mask = kwargs.get("image_mask", None)
@@ -515,7 +511,7 @@ class Qwen3_5Model(_Qwen3_5Model):
 
         if pixel_values_videos is not None:
             # --- Patch.3 ---
-            video_outputs:BaseModelOutputWithPooling = self.get_video_features(pixel_values_videos, video_grid_thw)
+            video_outputs: BaseModelOutputWithPooling = self.get_video_features(pixel_values_videos, video_grid_thw)
             video_embeds = video_outputs.pooler_output
             # sequence parallel patch for video embeds
             if get_parallel_state().sp_enabled:
@@ -644,6 +640,8 @@ def get_position_id(main_func, self, **kwargs):
     # must be a global func for multiproceesing serialize
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
+
+
 # --- Patch.1 ---
 
 
@@ -723,14 +721,14 @@ class Qwen3_5ForConditionalGeneration(_Qwen3_5ForConditionalGeneration):
         else:
             logits = self.lm_head(hidden_states)
         # --- Patch.2 ---
-        
+
         return Qwen3_5CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             rope_deltas=outputs.rope_deltas,
         )
-    
+
 
 def apply_veomni_qwen35_patch():
     logger.info_rank0("Apply VeOmni patch to Qwen3_5.")
@@ -741,8 +739,3 @@ def apply_veomni_qwen35_patch():
     hf_qwen35.Qwen3_5VisionAttention.forward = Qwen3_5VisionAttention_forward
     hf_qwen35.Qwen3_5VisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
     hf_qwen35.Qwen3_5VisionModel.rot_pos_emb = rot_pos_emb
-
-    if is_torch_npu_available:
-        from .npu_patch import apply_qwen35_npu_patch
-
-        apply_qwen35_npu_patch()

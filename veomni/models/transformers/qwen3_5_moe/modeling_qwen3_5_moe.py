@@ -1,20 +1,24 @@
+import copy
 from functools import partial
 from types import SimpleNamespace
 from typing import Optional, Union
 
-import copy
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-
+import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as hf_qwen35moe
 from transformers.cache_utils import Cache
 from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-    Qwen3_5MoeExperts as _Qwen3_5MoeExperts,
+    Qwen3_5MoeCausalLMOutputWithPast,
+    Qwen3_5MoeModelOutputWithPast,
+    Qwen3_5MoeVisionAttention,
+    Qwen3_5MoeVisionModel,
+    apply_rotary_pos_emb_vision,
+    eager_attention_forward,
+    load_balancing_loss_func,
 )
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeForConditionalGeneration as _Qwen3_5MoeForConditionalGeneration,
@@ -22,29 +26,19 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeModel as _Qwen3_5MoeModel,
 )
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-    Qwen3_5MoeCausalLMOutputWithPast,
-    Qwen3_5MoeModelOutputWithPast,
-    Qwen3_5MoeSparseMoeBlock,
-    Qwen3_5MoeVisionAttention,
-    Qwen3_5MoeVisionModel,
-    apply_rotary_pos_emb_vision,
-    eager_attention_forward,
-    load_balanced_loss_func,
-)
-import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as hf_qwen35moe
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
-    gather_outputs,
     gather_seq_scatter_heads,
     sp_pad_and_slice,
 )
 from ....ops import fused_moe_forward
+from ....utils import logging
 from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....utils.device import is_torch_npu_available
-from ....utils import logging
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
@@ -66,9 +60,9 @@ def Qwen3_5MoeTExperts_fused_moe_forward(
     assert top_k_weights is not None, "top_k_weights must be provided for fused implementation"
 
     # Split gate_up_proj into gate_proj and up_proj
-    gate_proj = self.gate_up_proj[:, : self.intermediate_size, :]
-    up_proj = self.gate_up_proj[:, self.intermediate_size :, :]
-    
+    gate_proj = self.gate_up_proj[:, : self.intermediate_dim, :]
+    up_proj = self.gate_up_proj[:, self.intermediate_dim :, :]
+
     gate_proj_t = gate_proj.contiguous()  # (num_experts, expert_dim, hidden_size)
     up_proj_t = up_proj.contiguous()  # (num_experts, expert_dim, hidden_size)
     down_proj_t = self.down_proj.contiguous()  # (num_experts, hidden_size, expert_dim)
@@ -84,6 +78,8 @@ def Qwen3_5MoeTExperts_fused_moe_forward(
         fc2_weight=down_proj_t,
     )
     return next_states
+
+
 # --- Patch.1 ---
 
 
@@ -96,6 +92,8 @@ def get_parallel_plan(self):
     from .parallel_plan import get_parallel_plan
 
     return get_parallel_plan()
+
+
 # --- Patch.1 ---
 
 
@@ -124,7 +122,7 @@ def Qwen3_5MoeVisionAttention_forward(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface: Callable = eager_attention_forward
+    attention_interface = eager_attention_forward
     if self.config._attn_implementation != "eager":
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
@@ -276,9 +274,7 @@ def Qwen3_5MoeVisionModel_forward(
 # get None pixel_values while others get valid pixel_values
 # ================================================================
 # --- Patch.1 ---
-def Qwen3_5MoeVisionModel_dummy_forward(
-    self: Qwen3_5MoeVisionModel
-):
+def Qwen3_5MoeVisionModel_dummy_forward(self: Qwen3_5MoeVisionModel):
     if get_parallel_state().sp_enabled:
         sp_size = get_parallel_state().sp_size
         pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
@@ -290,6 +286,8 @@ def Qwen3_5MoeVisionModel_dummy_forward(
         grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
         dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
     return self(**dummy_data)
+
+
 # --- Patch.1 ---
 
 
@@ -309,7 +307,7 @@ class Qwen3_5MoeModel(_Qwen3_5MoeModel):
         # --- Patch.7 ---
         moe_implementation = getattr(config, "_moe_implementation", "eager")
         config.text_config._moe_implementation = moe_implementation
-        config.text_config._expert_implementation = moe_implementation
+        config.text_config._experts_implementation = moe_implementation
         # --- Patch.7 ---
         super().__init__(config)
 
@@ -324,7 +322,7 @@ class Qwen3_5MoeModel(_Qwen3_5MoeModel):
                 The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
-        vision_output:BaseModelOutputWithPooling = self.visual(pixel_values, grid_thw=image_grid_thw)
+        vision_output: BaseModelOutputWithPooling = self.visual(pixel_values, grid_thw=image_grid_thw)
         # --- Patch.1 ---
         # image_embeds = vision_output.pooler_output
         # split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
@@ -373,7 +371,7 @@ class Qwen3_5MoeModel(_Qwen3_5MoeModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
-        
+
         # --- Patch.3 ---
         # we use the pre-computed image and video mask to support ulysses
         image_mask = kwargs.get("image_mask", None)
@@ -446,7 +444,7 @@ class Qwen3_5MoeModel(_Qwen3_5MoeModel):
 
         if pixel_values_videos is not None:
             # --- Patch.3 ---
-            video_outputs:BaseModelOutputWithPooling = self.get_video_features(pixel_values_videos, video_grid_thw)
+            video_outputs: BaseModelOutputWithPooling = self.get_video_features(pixel_values_videos, video_grid_thw)
             video_embeds = video_outputs.pooler_output
             # sequence parallel patch for video embeds
             if get_parallel_state().sp_enabled:
@@ -575,6 +573,8 @@ def get_position_id(main_func, self, **kwargs):
     # must be a global func for multiproceesing serialize
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
+
+
 # --- Patch.1 ---
 
 
@@ -587,7 +587,7 @@ class Qwen3_5MoeForConditionalGeneration(_Qwen3_5MoeForConditionalGeneration):
         fake_config.video_token_id = VIDEO_INPUT_INDEX
         # --- Patch.3 ---
         fake_model = SimpleNamespace(config=fake_config)
-        return partial(get_position_id, Qwen3VLMoeModel.get_rope_index, fake_model)
+        return partial(get_position_id, Qwen3_5MoeModel.get_rope_index, fake_model)
 
     # --- Patch.1 ---
 
@@ -654,14 +654,27 @@ class Qwen3_5MoeForConditionalGeneration(_Qwen3_5MoeForConditionalGeneration):
         else:
             logits = self.lm_head(hidden_states)
         # --- Patch.2 ---
-        
+
+        aux_loss = None
+        if kwargs.get("output_router_logits", False):
+            aux_loss = load_balancing_loss_func(
+                outputs.router_logits,
+                self.config.text_config.num_experts,
+                self.config.text_config.num_experts_per_tok,
+                attention_mask,
+            )
+            if labels is not None:
+                loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(
+                    loss.device
+                )  # make sure to reside in the same device
+
         return Qwen3_5MoeCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             rope_deltas=outputs.rope_deltas,
         )
-    
+
 
 def apply_veomni_qwen35moe_patch():
     logger.info_rank0("Apply VeOmni patch to Qwen3_5_moe.")
@@ -672,4 +685,3 @@ def apply_veomni_qwen35moe_patch():
     hf_qwen35moe.Qwen3_5MoePreTrainedModel.get_parallel_plan = get_parallel_plan
     hf_qwen35moe.Qwen3_5MoeVisionAttention.forward = Qwen3_5MoeVisionAttention_forward
     ALL_EXPERTS_FUNCTIONS.register("fused", Qwen3_5MoeTExperts_fused_moe_forward)
-    
