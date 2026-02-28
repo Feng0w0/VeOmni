@@ -374,3 +374,5 @@ def apply_veomni_attention_patch():
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_4_with_sp", flash_attention_forward)
     global _flash_attention_forward
     _flash_attention_forward = transformers_flash_attention_forward
+    if is_transformers_version_greater_or_equal_to("5.0.0"):
+        _flash_attention_forward = _transformers_flash_attention_forward

@@ -11,46 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from . import (
-    deepseek_v3,
-    flux,
-    janus,
-    llama,
-    movqgan,
-    qwen2,
-    qwen2_5_omni,
-    qwen2_5vl,
-    qwen2_vl,
-    qwen3,
-    qwen3_moe,
-    qwen3_omni_moe,
-    qwen3_vl,
-    qwen3_vl_moe,
-    seed_oss,
-    wan,
-    qwen3_5,
-    qwen3_5_moe,
-)
+from ...loader import MODELING_REGISTRY
 
 
-__all__ = [
-    "deepseek_v3",
-    "flux",
-    "janus",
-    "llama",
-    "movqgan",
-    "qwen2",
-    "qwen2_5_omni",
-    "qwen2_5vl",
-    "qwen2_vl",
-    "qwen3",
-    "qwen3_moe",
-    "qwen3_omni_moe",
-    "seed_oss",
-    "wan",
-    "qwen3_vl",
-    "qwen3_vl_moe",
-    "qwen3_5",
-    "qwen3_5_moe",
-]
+@MODELING_REGISTRY.register("qwen3_5")
+def register_qwen3_5_modeling(architecture: str):
+    from .modeling_qwen3_5 import Qwen3_5ForConditionalGeneration, Qwen3_5Model, apply_veomni_qwen35_patch
+
+    apply_veomni_qwen35_patch()
+
+    if "ForConditionalGeneration" in architecture:
+        return Qwen3_5ForConditionalGeneration
+    elif "Model" in architecture:
+        return Qwen3_5Model
+    else:
+        return Qwen3_5ForConditionalGeneration

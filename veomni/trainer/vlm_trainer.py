@@ -129,7 +129,7 @@ class VLMTrainer(BaseTrainer):
     def build_data_transform(self):
         args: Arguments = self.args
 
-        if self.model_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
+        if self.model_config.model_type in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"):
             process_function = process_sample_qwen3_vl
             position_id_func = self.model.get_position_id_func()
         elif self.model_config.model_type in ("qwen2_5_vl", "qwen2_vl"):

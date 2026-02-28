@@ -22,6 +22,8 @@ from ...utils.import_utils import (
     is_fused_moe_available,
     is_torch_npu_available,
 )
+from transformers.modeling_utils import PreTrainedModel
+
 
 
 logger = logging.get_logger(__name__)
@@ -60,6 +62,28 @@ def fused_moe_forward(
         fc2_weight,
     )
 
+# In transformers v5, `use_expert_implementation` is used to select the MoE function implementation.
+# This patch extends the original method to recognize our custom "fused" implementation
+# from fused_moe_forward, allowing users to leverage optimized MoE operations.
+def get_correct_experts_implementation(self, requested_experts: str | None) -> str:
+    applicable_experts = "grouped_mm" if requested_experts is None else requested_experts
+    if applicable_experts not in ["eager", "grouped_mm", "batched_mm", "fused"]:
+        message = (
+            f'Specified `experts_implementation="{applicable_experts}"` is not supported. The only possible arguments are '
+            '`experts_implementation="eager"`, `"experts_implementation=grouped_mm"`, `"experts_implementation=batched_mm"` and `"experts_implementation=fused"`.'
+        )
+        raise ValueError(message)
+
+    # Perform relevant checks
+    if applicable_experts == "grouped_mm":
+        try:
+            self._grouped_mm_can_dispatch()
+        except (ValueError, ImportError) as e:
+            if requested_experts == "grouped_mm":
+                raise e
+            applicable_experts = "eager"
+
+    return applicable_experts
 
 def apply_veomni_fused_moe_patch():
     global _fused_moe_forward
@@ -73,3 +97,5 @@ def apply_veomni_fused_moe_patch():
         _fused_moe_forward = group_gemm_fused_moe_forward
     else:
         _fused_moe_forward = None
+    
+    PreTrainedModel.get_correct_experts_implementation = get_correct_experts_implementation
