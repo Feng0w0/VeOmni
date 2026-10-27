@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import prepare_chunk_indices, prepare_chunk_offsets, get_autotune_config, get_npu_properties
+from .utils import prepare_chunk_indices, prepare_chunk_offsets, get_autotune_config, get_npu_properties, is_arch35
 
 CUBE_CORE_NUM = get_npu_properties()['num_aicore']
 
@@ -461,6 +461,9 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         if USE_G:
             b_dh1 *= bg_last_exp
             b_q = b_q * b_g_exp[None, :]
+            # Re-establish zero padding after FP32 promotion and gating on Ascend.
+            # A non-finite padded q lane poisons dot even when the matching do is zero.
+            b_q = tl.where((i_t * BT + tl.arange(0, BT) < T)[None, :], b_q, 0.0)
         if USE_GK:
             b_dh1 *= tl.exp(b_gk_last1[:, None])
         b_dh1 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
@@ -472,6 +475,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             if USE_G:
                 b_dh2 *= bg_last_exp
                 b_q = b_q * b_g_exp[None, :]
+                b_q = tl.where((i_t * BT + tl.arange(0, BT) < T)[None, :], b_q, 0.0)
             if USE_GK:
                 b_dh2 *= tl.exp(b_gk_last2[:, None])
             b_dh2 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
@@ -483,6 +487,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             if USE_G:
                 b_dh3 *= bg_last_exp
                 b_q = b_q * b_g_exp[None, :]
+                b_q = tl.where((i_t * BT + tl.arange(0, BT) < T)[None, :], b_q, 0.0)
             if USE_GK:
                 b_dh3 *= tl.exp(b_gk_last3[:, None])
             b_dh3 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
@@ -494,6 +499,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             if USE_G:
                 b_dh4 *= bg_last_exp
                 b_q = b_q * b_g_exp[None, :]
+                b_q = tl.where((i_t * BT + tl.arange(0, BT) < T)[None, :], b_q, 0.0)
             if USE_GK:
                 b_dh4 *= tl.exp(b_gk_last4[:, None])
             b_dh4 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
@@ -540,11 +546,13 @@ def chunk_gated_delta_rule_bwd_dhu(
     else:
         N, NT, chunk_offsets = len(cu_seqlens) - 1, len(chunk_indices), prepare_chunk_offsets(cu_seqlens, BT)
 
-    dh = q.new_empty(B, NT, H, K, V)
+    dh = q.new_zeros(B, NT, H, K, V)
     dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
-    dv2 = torch.empty_like(dv)
-
-    BV = 128
+    dv2 = torch.zeros_like(dv)
+    if is_arch35():
+        BV = 32
+    else:
+        BV = 128
 
     g = g.permute(0, 2, 1).contiguous()
 

@@ -29,6 +29,7 @@ from torch import Tensor
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated, torch_chunk_gated_delta_rule
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRMSNormGated
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.tol import (
     EAGER_ATOL,
     EAGER_GRAD_ATOL,
@@ -718,12 +719,14 @@ def test_chunk_gated_delta_rule_fla_matches_eager(device):
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="chunk_gated_delta_rule npu needs torch_npu")
 @pytest.mark.parametrize("impl", ("triton", "fla_npu"))
-def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl):
+@pytest.mark.parametrize("seq,bounds", [(64, None), (129, None), (129, (0, 17, 129))])
+@pytest.mark.parametrize("normalize", [False, True])
+def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, seq, bounds, normalize):
     _require_npu_gdr_dependencies(ascendc=impl == "fla_npu")
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
     other = resolve_op("chunk_gated_delta_rule", "standard", impl).wrapper
     torch.manual_seed(19)
-    batch, seq, heads, dim = 1, 64, 4, 64
+    batch, heads, dim = 1, 4, 128 if impl == "fla_npu" else 64
     q = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
     k = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
     v = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
@@ -732,8 +735,25 @@ def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl):
 
     q_e, k_e, v_e, g_e, b_e = make_grad_leaves(q, k, v, g, beta)
     q_o, k_o, v_o, g_o, b_o = make_grad_leaves(q, k, v, g, beta)
-    out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, use_qk_l2norm_in_kernel=True)
-    out_o, _ = other(q_o, k_o, v_o, g_o, b_o, use_qk_l2norm_in_kernel=True)
+    cu = torch.tensor(bounds, dtype=torch.int64) if bounds is not None else None
+    if bounds is None:
+        out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, use_qk_l2norm_in_kernel=normalize)
+    else:
+        # The eager backend has no packed API. Independent segment calls also
+        # catch accidental state leakage across packed sequence boundaries.
+        parts = []
+        for start, end in zip(bounds[:-1], bounds[1:], strict=True):
+            segment, _ = eager(
+                q_e[:, start:end],
+                k_e[:, start:end],
+                v_e[:, start:end],
+                g_e[:, start:end],
+                b_e[:, start:end],
+                use_qk_l2norm_in_kernel=normalize,
+            )
+            parts.append(segment)
+        out_e = torch.cat(parts, dim=1)
+    out_o, _ = other(q_o, k_o, v_o, g_o, b_o, cu_seqlens=cu, use_qk_l2norm_in_kernel=normalize)
     torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
 
     grad_output = torch.randn_like(out_e)
@@ -1028,7 +1048,7 @@ def test_fla_npu_missing_fla_npu_raises_actionable(monkeypatch: pytest.MonkeyPat
     sys.modules.pop("fla_npu", None)
 
     with pytest.raises(RuntimeError, match="fla_npu"):
-        m._ensure_fla_npu_registered()
+        m._get_gdn_ops()
 
 
 @pytest.mark.parametrize(
@@ -1053,3 +1073,102 @@ def test_chunk_scaled_dot_kkt_fwd_requires_g_and_beta(module_path: str) -> None:
     assert by_name["g"] is None
     assert by_name["beta"] is None
     assert "requires g and beta" in source
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("packed", [False, True])
+def test_fla_npu_stable_gdn_layout_and_grad_contract(monkeypatch, packed):
+    """Pin mixed layouts, saved intermediates and raw-gate gradient ownership."""
+    from types import SimpleNamespace
+
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu as m
+
+    q = torch.randn(1, 2, 65, 128, dtype=torch.bfloat16)
+    g = torch.randn(1, 65, 2)
+    beta = torch.rand(1, 65, 2, dtype=torch.bfloat16)
+    output = torch.randn(1, 65, 2, 128, dtype=torch.bfloat16)
+    cumulative = torch.randn_like(g)
+    a = torch.randn(1, 2, 65, 64, dtype=torch.bfloat16)
+    gradients = (q + 1, q + 2, q + 3, beta + 4, g + 5)
+    bounds = [0, 0, 17, 65] if packed else None
+    indices = {"64": [1, 0, 2, 0]} if packed else None
+
+    def fwd(q_in, k_in, v_in, g_in, beta_in, **kwargs):
+        assert q_in is q and k_in is q and v_in is q
+        assert g_in is g and beta_in is beta
+        assert kwargs["layout"] == "BNSD"
+        assert kwargs["disable_recompute"] is True
+        assert kwargs["use_exp2"] is False
+        assert kwargs["use_qk_l2norm_in_kernel"] is False
+        assert kwargs["cu_seqlens"] == bounds
+        assert kwargs["chunk_indices"] == (indices["64"] if packed else None)
+        return output, None, cumulative, a, None, None, q, q, None, None
+
+    def bwd(q_in, k_in, v_in, g_in, beta_in, a_in, do, scale, **kwargs):
+        assert q_in is q and k_in is q and v_in is q
+        assert g_in is cumulative and a_in is a
+        assert do is output  # BSND, never transposed to BNSD
+        assert kwargs["layout"] == "BNSD" and kwargs["use_exp2"] is False
+        assert kwargs["cu_seqlens"] == bounds
+        assert kwargs["chunk_indices"] == (indices["64"] if packed else None)
+        return (*gradients, None, None, None)
+
+    monkeypatch.setattr(
+        m,
+        "_get_gdn_ops",
+        lambda: SimpleNamespace(
+            chunk_gated_delta_rule_fwd=fwd,
+            chunk_gated_delta_rule_bwd=bwd,
+        ),
+    )
+    gc, out, saved_a, ht = m._chunk_fwd(
+        q,
+        q,
+        q,
+        g,
+        beta,
+        0.125,
+        None,
+        False,
+        None,
+        bounds,
+        None,
+        indices,
+        64,
+    )
+    assert gc is cumulative and out is output and saved_a is a and ht is None
+    grads = m._chunk_bwd(
+        q,
+        q,
+        q,
+        gc,
+        beta,
+        saved_a,
+        0.125,
+        None,
+        output,
+        None,
+        bounds,
+        None,
+        indices,
+        64,
+    )
+    assert all(actual is expected for actual, expected in zip(grads, gradients, strict=True))
+
+
+@pytest.mark.parametrize(
+    "dtype,dim,chunk",
+    [
+        (torch.float16, 128, 64),
+        (torch.bfloat16, 64, 64),
+        (torch.bfloat16, 128, 128),
+    ],
+)
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_fla_npu_common_domain_rejected_before_launch(dtype, dim, chunk):
+    """Unsupported A3/A5 full-backward shapes fail before loading kernels."""
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu as m
+
+    q = torch.empty(1, 2, 64, dim, dtype=dtype)
+    with pytest.raises(ValueError, match="A3/A5"):
+        m._validate_gdn_contract(q, q, q, chunk, None)

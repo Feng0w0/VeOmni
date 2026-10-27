@@ -422,6 +422,8 @@ def chunk_bwd_dqkwg(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     BK = 128 if cu_seqlens is None else 64
+    if K < BK:
+        BK = 1 << (K.bit_length() - 1)
     BV = 64
     NK = triton.cdiv(K, BK)
     dq = torch.empty_like(q)

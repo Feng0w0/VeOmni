@@ -730,3 +730,27 @@ model:
 
 - Fused MoE scatter/gather and backward launch bounds: [`fused_moe_ops.md`](fused_moe_ops.md)
 - Package layout and registration: `veomni/ops/README.md`
+
+
+### A3/A5 GDN through fla_npu
+
+Select `model.ops_implementation.chunk_gated_delta_rule_implementation: fla_npu`
+with a chip-matched package exposing `fla_npu.ops.ascendc.chunk_gated_delta_rule_fwd`
+and `chunk_gated_delta_rule_bwd`. Legacy `torch.ops.npu` registration is not required.
+The adapter shares one implementation across A3 and A5: BF16 Q/K/V, equal head
+counts, K=V=128 and chunk_size=64. Nonempty initial states must be BF16 and detached;
+final-state output is supported only when Q/K/V/g/beta do not require gradients.
+Use the Triton backend for configurations outside this adapter's domain.
+
+External tensors use [B,T,H,D]. The adapter converts Q/K/V to BNSD, keeps gates,
+beta and output gradients sequence-major, and saves the fused forward's cumulative
+gates and A for backward. L2 normalization stays outside the operator, and both
+passes use natural exponent semantics. The complete backward already returns the
+raw gate gradient; no extra reverse cumsum is applied. A3/A5 architecture selection
+belongs to fla_npu. Forward can use Phase6 fusion; the complete backward remains
+a multi-stage ACLNN executor. No A5-only fused preprocessing flags are enabled.
+
+Validate numerical parity on each target device using
+`pytest tests/ops/gated_delta_rule/test_gated_delta_rule.py -k npu_matches_eager`.
+An installed module or passing CPU adapter tests does not establish NPU kernel
+numerical compatibility; validate against the installed wheel on A3 and A5.
