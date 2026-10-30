@@ -1031,6 +1031,21 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         cu_seq_lens_q: torch.Tensor | None = None,
         packed_seq_lens: list[int] | tuple[int, ...] | None = None,
     ) -> torch.Tensor:
+        if hidden_states.device.type == "npu":
+            from veomni.ops.kernels.qsa_indexer.ascendc.qsa_indexer import (
+                qwen4_exp_qsa_indexer_forward_lightning,
+            )
+
+            return qwen4_exp_qsa_indexer_forward_lightning(
+                self,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values,
+                cu_seq_lens_q=cu_seq_lens_q,
+                packed_seq_lens=packed_seq_lens,
+            )
+
         # --- Patch.1: Select compact global QSA token indices for local queries under Ulysses/CP. ---
         # Using sequence-local RoPE inputs and gathering only the compressed keys
         # across the sequence-parallel group while returning local query selections.
