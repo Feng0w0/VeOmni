@@ -18,8 +18,9 @@ Uses the stable ``fla_npu.ops.ascendc`` GDN forward/backward pair on A3/A5.
 The library selects arch22/arch35; this adapter uses their common BF16,
 K=V=128, chunk_size=64 contract. Forward can use the Phase6 fused kernel;
 backward is a composite ACLNN executor, not a single fused kernel.
-The kernel contract is FLA ``[B, T, H, D]``; the fused ``torch.ops.npu``
-path wants ``[B, H, T, D]``.
+The public layout is FLA ``[B, T, H, D]``; AscendC consumes BNSD QKV.
+Q/K normalization reuses the vendored Triton L2Norm pair, with FP32
+intermediate arithmetic and reciprocal norms. QKV are materialized in BNSD.
 """
 
 from __future__ import annotations
@@ -52,7 +53,13 @@ class _Meta:
 
 
 def _l2norm_fwd(x: Tensor, dim: int = -1, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
-    """Return the FLA-style L2-normalized tensor and reciprocal norm."""
+    """Reuse fused NPU L2Norm, retaining FP32 reciprocal norms for backward."""
+    if x.device.type == "npu" and dim == -1:
+        from ...vendor.triton_core.l2norm import l2norm_fwd
+
+        with torch.npu.device(x.device):
+            y, inv_norm = l2norm_fwd(x.resolve_neg().contiguous(), eps=eps)
+        return y, inv_norm.unsqueeze(-1)
     original_dtype = x.dtype
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
     return (x * inv_norm).to(original_dtype), inv_norm
@@ -60,6 +67,15 @@ def _l2norm_fwd(x: Tensor, dim: int = -1, eps: float = 1e-6) -> tuple[Tensor, Te
 
 def _l2norm_bwd(y: Tensor, inv_norm: Tensor, grad_y: Tensor, dim: int = -1) -> Tensor:
     """Apply the L2-normalization Jacobian to ``grad_y``."""
+    if y.device.type == "npu" and dim == -1 and inv_norm.dtype == torch.float32:
+        from ...vendor.triton_core.l2norm import l2norm_bwd
+
+        with torch.npu.device(y.device):
+            return l2norm_bwd(
+                y.resolve_neg().contiguous(),
+                inv_norm.resolve_neg().contiguous(),
+                grad_y.resolve_neg().contiguous(),
+            )
     projection = (grad_y * y).sum(dim=dim, keepdim=True)
     return ((grad_y - y * projection) * inv_norm).to(y)
 
@@ -164,23 +180,19 @@ def _ensure_varlen_metadata(
     chunk_indices: dict[str, Tensor | None] | Tensor | None = None,
     chunk_indices_list: dict[str, list[int] | None] | list[int] | Tensor | None = None,
 ) -> tuple[Tensor, list[int], dict[str, Tensor | None], dict[str, list[int] | None]]:
-    """Materialize every host and device table needed by variable-length kernels."""
-    cu_seqlens = cu_seqlens.to(device=g.device, dtype=torch.int64)
+    """Resolve only host tables consumed by the stable AscendC API.
+
+    Device boundaries and chunk tensors are legacy Triton metadata. Keep
+    supplied tensors untouched; creating or uploading them here introduces
+    synchronization although neither AscendC entry consumes them.
+    """
     cu_seqlens_list = _as_int_list(cu_seqlens_list) or _as_int_list(cu_seqlens)
     assert cu_seqlens_list is not None
-
     tensor_indices = _as_chunk_dict(chunk_indices, chunk_size)
     list_indices = _as_chunk_list_dict(chunk_indices_list, chunk_size)
-    required_sizes = set(_DEFAULT_VARLEN_CHUNK_SIZES)
-    required_sizes.add(int(chunk_size))
-    required_sizes.add(_cumsum_block_t(g, chunk_size))
-
-    for size in required_sizes:
-        key = str(size)
-        if key not in tensor_indices or tensor_indices[key] is None:
-            tensor_indices[key] = _prepare_chunk_indices(cu_seqlens, size)
-        if key not in list_indices or list_indices[key] is None:
-            list_indices[key] = _prepare_chunk_indices_list(cu_seqlens_list, size)
+    key = str(chunk_size)
+    if list_indices.get(key) is None:
+        list_indices[key] = _prepare_chunk_indices_list(cu_seqlens_list, chunk_size)
     return cu_seqlens, cu_seqlens_list, tensor_indices, list_indices
 
 
@@ -282,8 +294,8 @@ def _chunk_fwd(
         q,
         k,
         v,
-        g.contiguous(),
-        beta.contiguous(),
+        g,
+        beta,
         initial_state=initial_state,
         output_final_state=output_final_state,
         chunk_size=chunk_size,
@@ -328,9 +340,9 @@ def _chunk_bwd(
         k,
         v,
         g,
-        beta.contiguous(),
+        beta,
         a,
-        grad_output.contiguous(),
+        grad_output,
         scale,
         chunk_size=chunk_size,
         cu_seqlens=cu_seqlens_list,
@@ -371,8 +383,8 @@ def forward(
     state is an empty tensor so the registry output stays tensors-only. This
     adapter does not expose ``dh0`` or consume ``dht``. Trainable
     ``initial_state`` and ``output_final_state=True`` with trainable inputs
-    are rejected. Extra NPU varlen tables are accepted; missing keys are
-    filled from ``cu_seqlens``.
+    are rejected. Extra NPU varlen tables are accepted; missing
+    host chunk tables are filled from ``cu_seqlens`` without device uploads.
     """
     from ...vendor.triton.utils import input_guard
 
@@ -381,8 +393,9 @@ def forward(
     if cu_seqlens is None:
         cu_seqlens = unused_like(query, dtype=torch.int32)
 
-    query_h = query.transpose(1, 2).contiguous()
-    key_h = key.transpose(1, 2).contiguous()
+    # The vendored L2Norm adapter materializes these BNSD views before launch.
+    query_h = query.transpose(1, 2)
+    key_h = key.transpose(1, 2)
     value_h = value.transpose(1, 2).contiguous()
 
     if query_h.dtype != key_h.dtype or key_h.dtype != value_h.dtype:
@@ -447,6 +460,8 @@ def forward(
         query_h, query_inv_norm = _l2norm_fwd(query_h)
         key_h, key_inv_norm = _l2norm_fwd(key_h)
     else:
+        query_h = query_h.contiguous()
+        key_h = key_h.contiguous()
         query_inv_norm = unused_like(query_h)
         key_inv_norm = unused_like(key_h)
 
