@@ -22,6 +22,7 @@ logger = logging.get_logger(__name__)
 
 ENV_DEFAULTS = {
     "MODELING_BACKEND": "veomni",
+    "VEOMNI_MOE_FORCE_BALANCE": "0",
 }
 
 

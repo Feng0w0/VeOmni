@@ -22,7 +22,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor
 
+from .....distributed.moe.forced_balance import force_balanced_routing
 from .....distributed.parallel_state import get_parallel_state
+from .....utils.env import get_env
 
 
 class GmmFunction(torch.autograd.Function):
@@ -178,6 +180,15 @@ def npu_ep_fused_moe_forward(
     Handles alltoall dispatch/combine for expert parallelism.
     """
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+    original_tokens = hidden_states.shape[0]
+    if get_env("VEOMNI_MOE_FORCE_BALANCE") == "1":
+        hidden_states, routing_weights, selected_experts = force_balanced_routing(
+            hidden_states,
+            routing_weights,
+            selected_experts,
+            num_experts,
+            1 if ep_group is None else dist.get_world_size(ep_group),
+        )
     input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
         dispatch_preprocess(selected_experts, num_experts, ep_group)
     )
@@ -208,7 +219,7 @@ def npu_ep_fused_moe_forward(
         num_global_tokens_per_local_expert,
         ep_group,
     )
-    return hidden_states
+    return hidden_states[:original_tokens]
 
 
 def dispatch_preprocess(
