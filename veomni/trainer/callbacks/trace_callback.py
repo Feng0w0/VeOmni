@@ -218,6 +218,12 @@ class EnvironMeterCallback(Callback):
         module = getattr(trainer.model, "unwrapped_module", None)
         self.lora_config = module.get_lora_config() if hasattr(module, "get_lora_config") else None
         self.freeze_vit = getattr(args.train, "freeze_vit", None) if self.lora_config is None else None
+        # Keep the standalone MM estimate separate from VeOmni's counter.
+        self._mm_flops_counter = None
+        if getattr(trainer.model.model_config, "model_type", None) == "qwen4_exp":
+            from ...utils.count_flops_mm import Qwen38NextFlopsCounter
+
+            self._mm_flops_counter = Qwen38NextFlopsCounter(trainer.model.model_config)
         self.trainer.environ_meter = helper.EnvironMeter(
             config=trainer.model.model_config,
             global_batch_size=args.train.global_batch_size,
@@ -244,12 +250,31 @@ class EnvironMeterCallback(Callback):
         **kwargs,
     ) -> None:
         delta_time = time.time() - self.start_time
+        # EnvironMeter.step clears sequence lengths; capture the MM estimate first.
+        mm_flops_achieved = None
+        if self._mm_flops_counter is not None:
+            meter = self.trainer.environ_meter
+            mm_flops_achieved = (
+                self._mm_flops_counter.estimate_flops(
+                    meter.batch_seqlens, delta_time, images_seqlens=meter.images_seqlens
+                )
+                / 1e12
+            )
         step_env_metrics = self.trainer.environ_meter.step(
             delta_time,
             global_step=state.global_step,
             lora_config=self.lora_config,
             freeze_vit=self.freeze_vit,
         )
+
+        mm_mfu_log = ""
+        if mm_flops_achieved is not None:
+            mm_flops_achieved = all_reduce(mm_flops_achieved, op="sum", group=self.parallel_state.dp_group)
+            flops_promised = step_env_metrics["flops_promised(T)"]
+            mm_mfu = mm_flops_achieved / flops_promised if flops_promised else 0
+            step_env_metrics["mm_flops_achieved(T)"] = mm_flops_achieved
+            step_env_metrics["mm_mfu"] = mm_mfu
+            mm_mfu_log = f", MM MFU {mm_mfu:.2%}"
 
         step_train_metrics = {
             "total_loss": loss,
@@ -276,6 +301,10 @@ class EnvironMeterCallback(Callback):
 
         self.trainer.step_train_metrics = step_train_metrics
         self.trainer.step_env_metrics = step_env_metrics
+        logger.info_rank0(
+            f"Step {state.global_step}: FLOPS {step_env_metrics['flops_achieved(T)']:.2f} TFLOP/s, "
+            f"MFU {step_env_metrics['mfu']:.2%}{mm_mfu_log}"
+        )
 
 
 class TqdmCallback(Callback):
